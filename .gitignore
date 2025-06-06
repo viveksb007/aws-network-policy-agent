@@ -14,4 +14,6 @@ amazon-network-policy-controller-k8s
 # Test build files
 test/build/
 
+*results.log
+aws-ebpf-sdk-go
 results.log
