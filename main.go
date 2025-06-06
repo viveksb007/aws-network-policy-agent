@@ -21,6 +21,9 @@ import (
 
 	"github.com/aws/aws-network-policy-agent/pkg/rpc"
 
+	"net/http"
+	_ "net/http/pprof"
+
 	"github.com/aws/aws-network-policy-agent/pkg/logger"
 
 	"github.com/spf13/pflag"
@@ -63,6 +66,11 @@ func main() {
 
 	log := logger.New(ctrlConfig.LogLevel, ctrlConfig.LogFile)
 	log.Infof("Starting network policy agent with log level: %s", ctrlConfig.LogLevel)
+
+	go func() {
+		log.Info("starting http server at 6060")
+		http.ListenAndServe("localhost:6060", nil)
+	}()
 
 	ctrl.SetLogger(logger.GetControllerRuntimeLogger())
 	restCFG, err := config.BuildRestConfig(ctrlConfig.RuntimeConfig)
