@@ -3,6 +3,7 @@ package ebpf
 import (
 	"sync"
 
+	fwrp "github.com/aws/aws-network-policy-agent/pkg/fwruleprocessor"
 	"k8s.io/apimachinery/pkg/types"
 )
 
@@ -28,7 +29,7 @@ func (m *MockBpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier
 	return nil
 }
 
-func (m *MockBpfClient) UpdateEbpfMaps(podIdentifier string, ingressFirewallRules []EbpfFirewallRules, egressFirewallRules []EbpfFirewallRules) error {
+func (m *MockBpfClient) UpdateEbpfMaps(podIdentifier string, ingressFirewallRules []fwrp.EbpfFirewallRules, egressFirewallRules []fwrp.EbpfFirewallRules) error {
 	return nil
 }
 

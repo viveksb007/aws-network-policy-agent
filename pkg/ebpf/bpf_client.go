@@ -7,10 +7,6 @@ import (
 	"fmt"
 	"io/ioutil"
 
-	"net"
-	"sort"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -20,11 +16,10 @@ import (
 	"github.com/aws/amazon-vpc-cni-k8s/rpc"
 	goelf "github.com/aws/aws-ebpf-sdk-go/pkg/elfparser"
 	goebpfmaps "github.com/aws/aws-ebpf-sdk-go/pkg/maps"
-	mapsv2 "github.com/aws/aws-ebpf-sdk-go/pkg/mapsv2"
 	"github.com/aws/aws-ebpf-sdk-go/pkg/tc"
-	"github.com/aws/aws-network-policy-agent/api/v1alpha1"
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf/conntrack"
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf/events"
+	fwrp "github.com/aws/aws-network-policy-agent/pkg/fwruleprocessor"
 	"github.com/aws/aws-network-policy-agent/pkg/logger"
 	"github.com/aws/aws-network-policy-agent/pkg/rpcclient"
 	"github.com/aws/aws-network-policy-agent/pkg/utils"
@@ -109,7 +104,7 @@ func prometheusRegister() {
 
 type BpfClient interface {
 	AttacheBPFProbes(pod types.NamespacedName, policyEndpoint string) error
-	UpdateEbpfMaps(podIdentifier string, ingressFirewallRules []EbpfFirewallRules, egressFirewallRules []EbpfFirewallRules) error
+	UpdateEbpfMaps(podIdentifier string, ingressFirewallRules []fwrp.EbpfFirewallRules, egressFirewallRules []fwrp.EbpfFirewallRules) error
 	UpdatePodStateEbpfMaps(podIdentifier string, state int, updateIngress bool, updateEgress bool) error
 	IsEBPFProbeAttached(podName string, podNamespace string) (bool, bool)
 	IsFirstPodInPodIdentifier(podIdentifier string) bool
@@ -134,12 +129,6 @@ type BPFContext struct {
 	conntrackMapInfo goebpfmaps.BpfMap
 }
 
-type EbpfFirewallRules struct {
-	IPCidr v1alpha1.NetworkAddress
-	Except []v1alpha1.NetworkAddress
-	L4Info []v1alpha1.Port
-}
-
 func NewBpfClient(nodeIP string, enablePolicyEventLogs, enableCloudWatchLogs bool,
 	enableIPv6 bool, conntrackTTL int, conntrackTableSize int) (*bpfClient, error) {
 	var conntrackMap goebpfmaps.BpfMap
@@ -156,8 +145,8 @@ func NewBpfClient(nodeIP string, enablePolicyEventLogs, enableCloudWatchLogs boo
 		EgressProgToPodsMap:       new(sync.Map),
 		AttachProbesToPodLock:     new(sync.Map),
 		DeletePodIdentifierLock:   new(sync.Map),
-		ingressInMemoryMap:        make(map[string]*mapsv2.InMemoryBpfMap),
-		egressInMemoryMap:         make(map[string]*mapsv2.InMemoryBpfMap),
+		ingressInMemoryMap:        make(map[string]*InMemoryBpfMap),
+		egressInMemoryMap:         make(map[string]*InMemoryBpfMap),
 	}
 	ingressBinary, egressBinary, eventsBinary,
 		cliBinary, hostMask := TC_INGRESS_BINARY, TC_EGRESS_BINARY, EVENTS_BINARY, EKS_CLI_BINARY, IPv4_HOST_MASK
@@ -174,6 +163,8 @@ func NewBpfClient(nodeIP string, enablePolicyEventLogs, enableCloudWatchLogs boo
 
 	ebpfClient.bpfSDKClient = goelf.New()
 	ebpfClient.bpfTCClient = tc.New([]string{POD_VETH_PREFIX, BRANCH_ENI_VETH_PREFIX})
+
+	ebpfClient.fwRuleProcessor = fwrp.NewFirewallRuleProcessor(nodeIP, hostMask, enableIPv6)
 
 	//Set RLIMIT
 	err = ebpfClient.bpfSDKClient.IncreaseRlimit()
@@ -333,9 +324,11 @@ type bpfClient struct {
 	// Stores podIdentifier to deletepod lock mapping
 	DeletePodIdentifierLock *sync.Map
 	// This is in-memory map backed by ingressBpfMap
-	ingressInMemoryMap map[string]*mapsv2.InMemoryBpfMap
+	ingressInMemoryMap map[string]*InMemoryBpfMap
 	// This is in-memory map backed by egressBpfMap
-	egressInMemoryMap map[string]*mapsv2.InMemoryBpfMap
+	egressInMemoryMap map[string]*InMemoryBpfMap
+
+	fwRuleProcessor *fwrp.FirewallRuleProcessor
 }
 
 func checkAndUpdateBPFBinaries(bpfTCClient tc.BpfTc, bpfBinaries []string, hostBinaryPath string) (bool, bool, bool, error) {
@@ -439,7 +432,7 @@ func (l *bpfClient) recoverBPFState(bpfTCClient tc.BpfTc, eBPFSDKClient goelf.Bp
 				val, found := bpfEntry.Maps[TC_INGRESS_MAP]
 				if found {
 					log().Infof("found ingress ebpf map for %v, map %+v", podIdentifier, val)
-					l.ingressInMemoryMap[podIdentifier], err = mapsv2.NewInMemoryBpfMap(&val)
+					l.ingressInMemoryMap[podIdentifier], err = NewInMemoryBpfMap(&val)
 					if err != nil {
 						log().Errorf("got err for ingress in-mem map for %v, err %v", podIdentifier, err)
 					} else {
@@ -451,7 +444,7 @@ func (l *bpfClient) recoverBPFState(bpfTCClient tc.BpfTc, eBPFSDKClient goelf.Bp
 				val, found := bpfEntry.Maps[TC_EGRESS_MAP]
 				if found {
 					log().Infof("found egress ebpf map for %v, map %+v", podIdentifier, val)
-					l.egressInMemoryMap[podIdentifier], err = mapsv2.NewInMemoryBpfMap(&val)
+					l.egressInMemoryMap[podIdentifier], err = NewInMemoryBpfMap(&val)
 					if err != nil {
 						log().Errorf("got err for egress in-mem map for %v, err %v", podIdentifier, err)
 					} else {
@@ -830,8 +823,8 @@ func (l *bpfClient) loadBPFProgram(fileName string, direction string,
 	return progInfo, progFD, nil
 }
 
-func (l *bpfClient) UpdateEbpfMaps(podIdentifier string, ingressFirewallRules []EbpfFirewallRules,
-	egressFirewallRules []EbpfFirewallRules) error {
+func (l *bpfClient) UpdateEbpfMaps(podIdentifier string, ingressFirewallRules []fwrp.EbpfFirewallRules,
+	egressFirewallRules []fwrp.EbpfFirewallRules) error {
 
 	var err error
 	start := time.Now()
@@ -848,7 +841,7 @@ func (l *bpfClient) UpdateEbpfMaps(podIdentifier string, ingressFirewallRules []
 			log().Infof("ingressInMem map %+v, bpfMap %+v", l.ingressInMemoryMap, mapToUpdate)
 			if _, exists := l.ingressInMemoryMap[podIdentifier]; !exists {
 				log().Infof("didn't found ingress in-mem map for %v", podIdentifier)
-				l.ingressInMemoryMap[podIdentifier], err = mapsv2.NewInMemoryBpfMap(&mapToUpdate)
+				l.ingressInMemoryMap[podIdentifier], err = NewInMemoryBpfMap(&mapToUpdate)
 				if err != nil {
 					log().Errorf("got err for ingress in-mem map for %v, err %v", podIdentifier, err)
 				} else {
@@ -871,7 +864,7 @@ func (l *bpfClient) UpdateEbpfMaps(podIdentifier string, ingressFirewallRules []
 			log().Infof("egressInMem map %+v, bpfMap %+v", l.egressInMemoryMap, mapToUpdate)
 			if _, exists := l.egressInMemoryMap[podIdentifier]; !exists {
 				log().Infof("didn't found egress in-mem map for %v", podIdentifier)
-				l.egressInMemoryMap[podIdentifier], err = mapsv2.NewInMemoryBpfMap(&mapToUpdate)
+				l.egressInMemoryMap[podIdentifier], err = NewInMemoryBpfMap(&mapToUpdate)
 				if err != nil {
 					log().Errorf("got err for egress in-mem map for %v, err %v", podIdentifier, err)
 				} else {
@@ -969,10 +962,10 @@ func (l *bpfClient) IsFirstPodInPodIdentifier(podIdentifier string) bool {
 	return firstPodInPodIdentifier
 }
 
-func (l *bpfClient) updateEbpfMap(firewallRules []EbpfFirewallRules, inMemMap *mapsv2.InMemoryBpfMap) error {
+func (l *bpfClient) updateEbpfMap(firewallRules []fwrp.EbpfFirewallRules, inMemMap *InMemoryBpfMap) error {
 	start := time.Now()
 	duration := msSince(start)
-	mapEntries, err := l.computeMapEntriesFromEndpointRules(firewallRules)
+	mapEntries, err := l.fwRuleProcessor.ComputeMapEntriesFromEndpointRules(firewallRules)
 	if err != nil {
 		log().Errorf("Trie entry creation/validation failed %v", err)
 		return err
@@ -987,227 +980,6 @@ func (l *bpfClient) updateEbpfMap(firewallRules []EbpfFirewallRules, inMemMap *m
 		return err
 	}
 	return nil
-}
-
-func sortFirewallRulesByPrefixLength(rules []EbpfFirewallRules, prefixLenStr string) {
-	sort.Slice(rules, func(i, j int) bool {
-
-		prefixSplit := strings.Split(prefixLenStr, "/")
-		prefixLen, _ := strconv.Atoi(prefixSplit[1])
-		prefixLenIp1 := prefixLen
-		prefixLenIp2 := prefixLen
-
-		if strings.Contains(string(rules[i].IPCidr), "/") {
-			prefixIp1 := strings.Split(string(rules[i].IPCidr), "/")
-			prefixLenIp1, _ = strconv.Atoi(prefixIp1[1])
-
-		}
-
-		if strings.Contains(string(rules[j].IPCidr), "/") {
-
-			prefixIp2 := strings.Split(string(rules[j].IPCidr), "/")
-			prefixLenIp2, _ = strconv.Atoi(prefixIp2[1])
-		}
-
-		return prefixLenIp1 < prefixLenIp2
-	})
-}
-
-func mergeDuplicateL4Info(ports []v1alpha1.Port) []v1alpha1.Port {
-	uniquePorts := make(map[string]v1alpha1.Port)
-	var result []v1alpha1.Port
-	var key string
-
-	for _, p := range ports {
-
-		portKey := 0
-		endPortKey := 0
-
-		if p.Port != nil {
-			portKey = int(*p.Port)
-		}
-
-		if p.EndPort != nil {
-			endPortKey = int(*p.EndPort)
-		}
-		if p.Protocol == nil {
-			key = fmt.Sprintf("%s-%d-%d", "", portKey, endPortKey)
-		} else {
-			key = fmt.Sprintf("%s-%d-%d", *p.Protocol, portKey, endPortKey)
-		}
-
-		if _, ok := uniquePorts[key]; ok {
-			continue
-		} else {
-			uniquePorts[key] = p
-		}
-	}
-
-	for _, port := range uniquePorts {
-		result = append(result, port)
-	}
-
-	return result
-}
-
-func (l *bpfClient) computeMapEntriesFromEndpointRules(firewallRules []EbpfFirewallRules) (map[string][]byte, error) {
-
-	firewallMap := make(map[string][]byte)
-	ipCIDRs := make(map[string][]v1alpha1.Port)
-	nonHostCIDRs := make(map[string][]v1alpha1.Port)
-	isCatchAllIPEntryPresent, allowAll := false, false
-	var catchAllIPPorts []v1alpha1.Port
-
-	//Traffic from the local node should always be allowed. Add NodeIP by default to map entries.
-	_, mapKey, _ := net.ParseCIDR(l.nodeIP + l.hostMask)
-	key := utils.ComputeTrieKey(*mapKey, l.enableIPv6)
-	value := utils.ComputeTrieValue([]v1alpha1.Port{}, true, false)
-	firewallMap[string(key)] = value
-
-	//Sort the rules
-	sortFirewallRulesByPrefixLength(firewallRules, l.hostMask)
-
-	//Check and aggregate L4 Port Info for Catch All Entries.
-	catchAllIPPorts, isCatchAllIPEntryPresent, allowAll = l.checkAndDeriveCatchAllIPPorts(firewallRules)
-	if isCatchAllIPEntryPresent {
-		//Add the Catch All IP entry
-		_, mapKey, _ := net.ParseCIDR("0.0.0.0/0")
-		key := utils.ComputeTrieKey(*mapKey, l.enableIPv6)
-		value := utils.ComputeTrieValue(catchAllIPPorts, allowAll, false)
-		firewallMap[string(key)] = value
-	}
-
-	for _, firewallRule := range firewallRules {
-		var cidrL4Info []v1alpha1.Port
-
-		if !strings.Contains(string(firewallRule.IPCidr), "/") {
-			firewallRule.IPCidr += v1alpha1.NetworkAddress(l.hostMask)
-		}
-
-		if utils.IsNodeIP(l.nodeIP, string(firewallRule.IPCidr)) {
-			continue
-		}
-
-		if l.enableIPv6 && !strings.Contains(string(firewallRule.IPCidr), "::") {
-			log().Debugf("Skipping ipv4 rule in ipv6 cluster CIDR: %s", string(firewallRule.IPCidr))
-			continue
-		}
-
-		if !l.enableIPv6 && strings.Contains(string(firewallRule.IPCidr), "::") {
-			log().Debugf("Skipping ipv6 rule in ipv4 cluster CIDR: %s", string(firewallRule.IPCidr))
-			continue
-		}
-
-		if !utils.IsCatchAllIPEntry(string(firewallRule.IPCidr)) {
-			if len(firewallRule.L4Info) == 0 {
-				l.addCatchAllL4Entry(&firewallRule)
-			}
-			if utils.IsNonHostCIDR(string(firewallRule.IPCidr)) {
-				existingL4Info, ok := nonHostCIDRs[string(firewallRule.IPCidr)]
-				if ok {
-					firewallRule.L4Info = append(firewallRule.L4Info, existingL4Info...)
-				} else {
-					// Check if the /m entry is part of any /n CIDRs that we've encountered so far
-					// If found, we need to include the port and protocol combination against the current entry as well since
-					// we use LPM TRIE map and the /m will always win out.
-					cidrL4Info = l.checkAndDeriveL4InfoFromAnyMatchingCIDRs(string(firewallRule.IPCidr), nonHostCIDRs)
-					if len(cidrL4Info) > 0 {
-						firewallRule.L4Info = append(firewallRule.L4Info, cidrL4Info...)
-					}
-				}
-				nonHostCIDRs[string(firewallRule.IPCidr)] = firewallRule.L4Info
-			} else {
-				if existingL4Info, ok := ipCIDRs[string(firewallRule.IPCidr)]; ok {
-					firewallRule.L4Info = append(firewallRule.L4Info, existingL4Info...)
-				}
-				// Check if the /32 entry is part of any non host CIDRs that we've encountered so far
-				// If found, we need to include the port and protocol combination against the current entry as well since
-				// we use LPM TRIE map and the /32 will always win out.
-				cidrL4Info = l.checkAndDeriveL4InfoFromAnyMatchingCIDRs(string(firewallRule.IPCidr), nonHostCIDRs)
-				if len(cidrL4Info) > 0 {
-					firewallRule.L4Info = append(firewallRule.L4Info, cidrL4Info...)
-				}
-				ipCIDRs[string(firewallRule.IPCidr)] = firewallRule.L4Info
-			}
-			//Include port and protocol combination paired with catch all entries
-			firewallRule.L4Info = append(firewallRule.L4Info, catchAllIPPorts...)
-
-			log().Infof("Updating Map with IP Key: %s", string(firewallRule.IPCidr))
-			_, firewallMapKey, _ := net.ParseCIDR(string(firewallRule.IPCidr))
-			// Key format: Prefix length (4 bytes) followed by 4/16byte IP address
-			firewallKey := utils.ComputeTrieKey(*firewallMapKey, l.enableIPv6)
-
-			if len(firewallRule.L4Info) != 0 {
-				mergedL4Info := mergeDuplicateL4Info(firewallRule.L4Info)
-				firewallRule.L4Info = mergedL4Info
-
-			}
-			firewallValue := utils.ComputeTrieValue(firewallRule.L4Info, allowAll, false)
-			firewallMap[string(firewallKey)] = firewallValue
-		}
-		if firewallRule.Except != nil {
-			for _, exceptCIDR := range firewallRule.Except {
-				_, mapKey, _ := net.ParseCIDR(string(exceptCIDR))
-				key := utils.ComputeTrieKey(*mapKey, l.enableIPv6)
-				log().Infof("Parsed Except CIDR IP Key: %s", mapKey.String())
-				if len(firewallRule.L4Info) != 0 {
-					mergedL4Info := mergeDuplicateL4Info(firewallRule.L4Info)
-					firewallRule.L4Info = mergedL4Info
-				}
-				value := utils.ComputeTrieValue(firewallRule.L4Info, false, true)
-				firewallMap[string(key)] = value
-			}
-		}
-	}
-
-	return firewallMap, nil
-}
-
-func (l *bpfClient) checkAndDeriveCatchAllIPPorts(firewallRules []EbpfFirewallRules) ([]v1alpha1.Port, bool, bool) {
-	var catchAllL4Info []v1alpha1.Port
-	isCatchAllIPEntryPresent := false
-	allowAllPortAndProtocols := false
-	for _, firewallRule := range firewallRules {
-		if !strings.Contains(string(firewallRule.IPCidr), "/") {
-			firewallRule.IPCidr += v1alpha1.NetworkAddress(l.hostMask)
-		}
-		if !l.enableIPv6 && strings.Contains(string(firewallRule.IPCidr), "::") {
-			log().Debug("IPv6 catch all entry in IPv4 mode - skip ")
-			continue
-		}
-		if utils.IsCatchAllIPEntry(string(firewallRule.IPCidr)) {
-			catchAllL4Info = append(catchAllL4Info, firewallRule.L4Info...)
-			isCatchAllIPEntryPresent = true
-			if len(firewallRule.L4Info) == 0 {
-				//All ports and protocols
-				allowAllPortAndProtocols = true
-			}
-		}
-	}
-	log().Debugf("Total L4 entry count for catch all entry: count: %d", len(catchAllL4Info))
-	return catchAllL4Info, isCatchAllIPEntryPresent, allowAllPortAndProtocols
-}
-
-func (l *bpfClient) checkAndDeriveL4InfoFromAnyMatchingCIDRs(firewallRule string,
-	nonHostCIDRs map[string][]v1alpha1.Port) []v1alpha1.Port {
-	var matchingCIDRL4Info []v1alpha1.Port
-
-	_, ipToCheck, _ := net.ParseCIDR(firewallRule)
-	for nonHostCIDR, l4Info := range nonHostCIDRs {
-		_, cidrEntry, _ := net.ParseCIDR(nonHostCIDR)
-		if cidrEntry.Contains(ipToCheck.IP) {
-			log().Debugf("Found a CIDR match for IP: %s in CIDR %s ", firewallRule, nonHostCIDR)
-			matchingCIDRL4Info = append(matchingCIDRL4Info, l4Info...)
-		}
-	}
-	return matchingCIDRL4Info
-}
-
-func (l *bpfClient) addCatchAllL4Entry(firewallRule *EbpfFirewallRules) {
-	catchAllL4Entry := v1alpha1.Port{
-		Protocol: &CATCH_ALL_PROTOCOL,
-	}
-	firewallRule.L4Info = append(firewallRule.L4Info, catchAllL4Entry)
 }
 
 func (l *bpfClient) DeletePodFromIngressProgPodCaches(podName string, podNamespace string) {
