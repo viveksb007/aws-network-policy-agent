@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/buffer"
 	"go.uber.org/zap/zapcore"
 	lumberjack "gopkg.in/natefinch/lumberjack.v2"
 )
@@ -55,10 +56,40 @@ func getZapLevel(inputLogLevel string) zapcore.Level {
 	}
 }
 
+// contextFirstEncoder wraps a JSON encoder so that fields added via
+// With() (e.g. trace_id) appear before the msg field in JSON output.
+// Default zap order: level, ts, caller, msg, context-fields
+// Desired order:     level, ts, caller, context-fields, msg
+type contextFirstEncoder struct {
+	zapcore.Encoder
+	msgKey string
+}
+
 func getEncoder() zapcore.Encoder {
 	encoderConfig := zap.NewProductionEncoderConfig()
 	encoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
-	return zapcore.NewJSONEncoder(encoderConfig)
+	msgKey := encoderConfig.MessageKey
+	encoderConfig.MessageKey = "" // suppress auto-written msg
+	return &contextFirstEncoder{
+		Encoder: zapcore.NewJSONEncoder(encoderConfig),
+		msgKey:  msgKey,
+	}
+}
+
+func (e *contextFirstEncoder) Clone() zapcore.Encoder {
+	return &contextFirstEncoder{
+		Encoder: e.Encoder.Clone(),
+		msgKey:  e.msgKey,
+	}
+}
+
+func (e *contextFirstEncoder) EncodeEntry(entry zapcore.Entry, fields []zapcore.Field) (*buffer.Buffer, error) {
+	// Prepend msg as a regular field so it appears after With() context
+	// fields (like trace_id) but before any per-call fields.
+	if e.msgKey != "" {
+		fields = append([]zapcore.Field{zap.String(e.msgKey, entry.Message)}, fields...)
+	}
+	return e.Encoder.EncodeEntry(entry, fields)
 }
 
 // buildZapCore creates the common zapcore.Core used by all loggers
